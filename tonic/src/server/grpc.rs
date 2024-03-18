@@ -31,6 +31,7 @@ macro_rules! t {
 /// Each request handler method accepts some service that implements the
 /// corresponding service trait and a http request that contains some body that
 /// implements some [`Body`].
+#[derive(Clone)]
 pub struct Grpc<T> {
     codec: T,
     /// Which compression encodings does the server accept for requests?

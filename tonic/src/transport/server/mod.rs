@@ -486,7 +486,7 @@ impl<L> Server<L> {
         }
     }
 
-    pub(crate) async fn serve_with_shutdown<S, I, F, IO, IE, ResBody>(
+    pub async fn serve_with_shutdown<S, I, F, IO, IE, ResBody>(
         self,
         svc: S,
         incoming: I,

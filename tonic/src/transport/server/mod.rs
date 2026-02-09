@@ -1,6 +1,7 @@
 //! Server implementation and builder.
 
 mod conn;
+mod display_error_stack;
 mod incoming;
 mod io_stream;
 mod service;
@@ -45,6 +46,7 @@ use self::service::{ConnectInfoLayer, ServerIo};
 use super::service::GrpcTimeout;
 use crate::body::Body;
 use crate::service::RecoverErrorLayer;
+use crate::transport::server::display_error_stack::DisplayErrorStack;
 use bytes::Bytes;
 use http::{Request, Response};
 use http_body_util::BodyExt;
@@ -66,6 +68,7 @@ use tower::{
     layer::util::{Identity, Stack},
     layer::Layer,
     limit::concurrency::ConcurrencyLimitLayer,
+    load_shed::LoadShedLayer,
     util::BoxCloneService,
     Service, ServiceBuilder, ServiceExt,
 };
@@ -87,6 +90,7 @@ const DEFAULT_HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 pub struct Server<L = Identity> {
     trace_interceptor: Option<TraceInterceptor>,
     concurrency_limit: Option<usize>,
+    load_shed: bool,
     timeout: Option<Duration>,
     #[cfg(feature = "_tls-any")]
     tls: Option<TlsAcceptor>,
@@ -99,6 +103,7 @@ pub struct Server<L = Identity> {
     http2_keepalive_timeout: Duration,
     http2_adaptive_window: Option<bool>,
     http2_max_pending_accept_reset_streams: Option<usize>,
+    http2_max_local_error_reset_streams: Option<usize>,
     http2_max_header_list_size: Option<u32>,
     max_frame_size: Option<u32>,
     accept_http1: bool,
@@ -111,6 +116,7 @@ impl Default for Server<Identity> {
         Self {
             trace_interceptor: None,
             concurrency_limit: None,
+            load_shed: false,
             timeout: None,
             #[cfg(feature = "_tls-any")]
             tls: None,
@@ -123,6 +129,7 @@ impl Default for Server<Identity> {
             http2_keepalive_timeout: DEFAULT_HTTP2_KEEPALIVE_TIMEOUT,
             http2_adaptive_window: None,
             http2_max_pending_accept_reset_streams: None,
+            http2_max_local_error_reset_streams: None,
             http2_max_header_list_size: None,
             max_frame_size: None,
             accept_http1: false,
@@ -134,7 +141,7 @@ impl Default for Server<Identity> {
 
 /// A stack based [`Service`] router.
 #[cfg(feature = "router")]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Router<L = Identity> {
     server: Server<L>,
     routes: Routes,
@@ -177,6 +184,27 @@ impl<L> Server<L> {
             concurrency_limit: Some(limit),
             ..self
         }
+    }
+
+    /// Enable or disable load shedding. The default is disabled.
+    ///
+    /// When load shedding is enabled, if the service responds with not ready
+    /// the request will immediately be rejected with a
+    /// [`resource_exhausted`](https://docs.rs/tonic/latest/tonic/struct.Status.html#method.resource_exhausted) error.
+    /// The default is to buffer requests. This is especially useful in combination with
+    /// setting a concurrency limit per connection.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use tonic::transport::Server;
+    /// # use tower_service::Service;
+    /// # let builder = Server::builder();
+    /// builder.load_shed(true);
+    /// ```
+    #[must_use]
+    pub fn load_shed(self, load_shed: bool) -> Self {
+        Server { load_shed, ..self }
     }
 
     /// Set a timeout on for all request handlers.
@@ -314,11 +342,24 @@ impl<L> Server<L> {
         }
     }
 
+    /// Configures the maximum number of local reset streams allowed before a GOAWAY will be sent.
+    ///
+    /// This will default to whatever the default in hyper is.
+    #[must_use]
+    pub fn http2_max_local_error_reset_streams(self, max: Option<usize>) -> Self {
+        Server {
+            http2_max_local_error_reset_streams: max,
+            ..self
+        }
+    }
+
     /// Set whether TCP keepalive messages are enabled on accepted connections.
     ///
     /// If `None` is specified, keepalive is disabled, otherwise the duration
     /// specified will be the time to remain idle before sending TCP keepalive
     /// probes.
+    ///
+    /// Important: This setting is only respected when not using `serve_with_incoming`.
     ///
     /// Default is no keepalive (`None`)
     ///
@@ -514,6 +555,7 @@ impl<L> Server<L> {
             service_builder: self.service_builder.layer(new_layer),
             trace_interceptor: self.trace_interceptor,
             concurrency_limit: self.concurrency_limit,
+            load_shed: self.load_shed,
             timeout: self.timeout,
             #[cfg(feature = "_tls-any")]
             tls: self.tls,
@@ -527,6 +569,7 @@ impl<L> Server<L> {
             http2_adaptive_window: self.http2_adaptive_window,
             http2_max_pending_accept_reset_streams: self.http2_max_pending_accept_reset_streams,
             http2_max_header_list_size: self.http2_max_header_list_size,
+            http2_max_local_error_reset_streams: self.http2_max_local_error_reset_streams,
             max_frame_size: self.max_frame_size,
             accept_http1: self.accept_http1,
             max_connection_age: self.max_connection_age,
@@ -643,6 +686,7 @@ impl<L> Server<L> {
     {
         let trace_interceptor = self.trace_interceptor.clone();
         let concurrency_limit = self.concurrency_limit;
+        let load_shed = self.load_shed;
         let init_connection_window_size = self.init_connection_window_size;
         let init_stream_window_size = self.init_stream_window_size;
         let max_concurrent_streams = self.max_concurrent_streams;
@@ -655,6 +699,7 @@ impl<L> Server<L> {
         let http2_keepalive_timeout = self.http2_keepalive_timeout;
         let http2_adaptive_window = self.http2_adaptive_window;
         let http2_max_pending_accept_reset_streams = self.http2_max_pending_accept_reset_streams;
+        let http2_max_local_error_reset_streams = self.http2_max_local_error_reset_streams;
         let max_connection_age = self.max_connection_age;
 
         let svc = self.service_builder.service(svc);
@@ -667,6 +712,7 @@ impl<L> Server<L> {
         let mut svc = MakeSvc {
             inner: svc,
             concurrency_limit,
+            load_shed,
             timeout,
             trace_interceptor,
             _io: PhantomData,
@@ -689,6 +735,7 @@ impl<L> Server<L> {
                 .keep_alive_timeout(http2_keepalive_timeout)
                 .adaptive_window(http2_adaptive_window.unwrap_or_default())
                 .max_pending_accept_reset_streams(http2_max_pending_accept_reset_streams)
+                .max_local_error_reset_streams(http2_max_local_error_reset_streams)
                 .max_frame_size(max_frame_size);
 
             if let Some(max_header_list_size) = max_header_list_size {
@@ -715,7 +762,7 @@ impl<L> Server<L> {
                     let io = match io {
                         Some(Ok(io)) => io,
                         Some(Err(e)) => {
-                            trace!("error accepting connection: {:#}", e);
+                            trace!("error accepting connection: {}", DisplayErrorStack(&*e));
                             continue;
                         },
                         None => {
@@ -786,7 +833,7 @@ fn serve_connection<B, IO, S, E>(
                 tokio::select! {
                     rv = &mut conn => {
                         if let Err(err) = rv {
-                            debug!("failed serving connection: {:#}", err);
+                            debug!("failed serving connection: {}", DisplayErrorStack(&*err));
                         }
                         break;
                     },
@@ -1047,6 +1094,7 @@ impl<S> fmt::Debug for Svc<S> {
 #[derive(Clone)]
 struct MakeSvc<S, IO> {
     concurrency_limit: Option<usize>,
+    load_shed: bool,
     timeout: Option<Duration>,
     inner: S,
     trace_interceptor: Option<TraceInterceptor>,
@@ -1080,6 +1128,7 @@ where
 
         let svc = ServiceBuilder::new()
             .layer(RecoverErrorLayer::new())
+            .option_layer(self.load_shed.then_some(LoadShedLayer::new()))
             .option_layer(concurrency_limit.map(ConcurrencyLimitLayer::new))
             .layer_fn(|s| GrpcTimeout::new(s, timeout))
             .service(svc);
